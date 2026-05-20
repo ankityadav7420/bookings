@@ -1,0 +1,233 @@
+import mongoose, { Types } from "mongoose";
+import { Booking } from "../models/Booking";
+import { Payment } from "../models/Payment";
+import { SeatHold } from "../models/SeatHold";
+import { SeatReservation } from "../models/SeatReservation";
+import { Show } from "../models/Show";
+import { Theater } from "../models/Theater";
+import { User } from "../models/User";
+import { ApiError } from "../utils/ApiError";
+import { generateBookingCode } from "../utils/code";
+import { notificationService } from "./notification.service";
+
+const HOLD_MINUTES = 8;
+const CONVENIENCE_FEE_RATE = 0.05;
+
+const normalizeSeat = (seat: string): string => seat.trim().toUpperCase();
+
+const getScreenSeats = async (showId: string) => {
+  const show = await Show.findById(showId).populate("theater");
+  if (!show) throw new ApiError(404, "Show not found");
+  if (show.status === "cancelled" || show.startsAt < new Date()) {
+    throw new ApiError(400, "Show is not available for booking");
+  }
+
+  const theater = await Theater.findById(show.theater);
+  const screen = theater?.screens.find((item) => item.name === show.screenName);
+  if (!theater || !screen) throw new ApiError(404, "Screen not found for this show");
+
+  return { show, theater, seats: screen.seats };
+};
+
+const calculateAmount = (selectedSeats: string[], screenSeats: Awaited<ReturnType<typeof getScreenSeats>>["seats"], show: Awaited<ReturnType<typeof getScreenSeats>>["show"]) => {
+  const seatMap = new Map(screenSeats.map((seat) => [`${seat.row}${seat.number}`, seat]));
+  let amount = 0;
+
+  for (const seatNo of selectedSeats) {
+    const seat = seatMap.get(seatNo);
+    if (!seat || !seat.isActive) {
+      throw new ApiError(400, `Seat ${seatNo} does not exist or is inactive`);
+    }
+    const tier = show.prices.find((price) => price.seatType === seat.type);
+    if (!tier) throw new ApiError(400, `Price is not configured for ${seat.type} seats`);
+    amount += tier.price;
+  }
+
+  const convenienceFee = Math.round(amount * CONVENIENCE_FEE_RATE);
+  return { amount, convenienceFee, totalAmount: amount + convenienceFee };
+};
+
+export const bookingService = {
+  async getSeatMap(showId: string) {
+    const { seats } = await getScreenSeats(showId);
+    const reservations = await SeatReservation.find({ show: showId });
+    const reservedMap = new Map(reservations.map((reservation) => [reservation.seat, reservation.status]));
+
+    return seats.map((seat) => {
+      const seatNo = `${seat.row}${seat.number}`;
+      return {
+        seat: seatNo,
+        row: seat.row,
+        number: seat.number,
+        type: seat.type,
+        isActive: seat.isActive,
+        status: !seat.isActive ? "blocked" : reservedMap.get(seatNo) ?? "available"
+      };
+    });
+  },
+
+  async holdSeats(userId: string, showId: string, rawSeats: string[]) {
+    const selectedSeats = [...new Set(rawSeats.map(normalizeSeat))];
+    if (selectedSeats.length === 0) throw new ApiError(400, "At least one seat is required");
+
+    const session = await mongoose.startSession();
+    try {
+      return await session.withTransaction(async () => {
+        const { show, theater, seats } = await getScreenSeats(showId);
+        const totals = calculateAmount(selectedSeats, seats, show);
+        const expiresAt = new Date(Date.now() + HOLD_MINUTES * 60 * 1000);
+
+        await SeatReservation.deleteMany({
+          show: show._id,
+          status: "held",
+          expiresAt: { $lte: new Date() }
+        }).session(session);
+
+        const hold = await SeatHold.create(
+          [
+            {
+              user: userId,
+              show: show._id,
+              seats: selectedSeats,
+              status: "held",
+              expiresAt
+            }
+          ],
+          { session }
+        );
+
+        try {
+          await SeatReservation.insertMany(
+            selectedSeats.map((seat) => ({
+              show: show._id,
+              seat,
+              user: userId,
+              hold: hold[0]._id,
+              status: "held",
+              expiresAt
+            })),
+            { session, ordered: true }
+          );
+        } catch (error: any) {
+          if (error.code === 11000) {
+            throw new ApiError(409, "One or more selected seats are already held or booked");
+          }
+          throw error;
+        }
+
+        const booking = await Booking.create(
+          [
+            {
+              bookingCode: generateBookingCode(),
+              user: userId,
+              show: show._id,
+              movie: show.movie,
+              theater: theater._id,
+              seats: selectedSeats,
+              ...totals,
+              status: "pending_payment"
+            }
+          ],
+          { session }
+        );
+
+        await SeatHold.updateOne({ _id: hold[0]._id }, { booking: booking[0]._id }, { session });
+
+        return {
+          hold: hold[0],
+          booking: booking[0],
+          expiresAt,
+          message: "Seats held. Complete payment before hold expiry."
+        };
+      });
+    } finally {
+      await session.endSession();
+    }
+  },
+
+  async confirmBooking(userId: string, providerOrderId: string, providerPaymentId: string, providerSignature: string) {
+    const session = await mongoose.startSession();
+    try {
+      return await session.withTransaction(async () => {
+        const payment = await Payment.findOne({ providerOrderId }).session(session);
+        if (!payment) throw new ApiError(404, "Payment order not found");
+        if (String(payment.user) !== userId) throw new ApiError(403, "Payment does not belong to this user");
+        if (payment.status === "paid") throw new ApiError(400, "Payment is already verified");
+
+        const booking = await Booking.findById(payment.booking).session(session);
+        if (!booking) throw new ApiError(404, "Booking not found");
+        if (booking.status !== "pending_payment") throw new ApiError(400, "Booking is not pending payment");
+
+        const hold = await SeatHold.findOne({ booking: booking._id, status: "held" }).session(session);
+        if (!hold || hold.expiresAt <= new Date()) {
+          await this.failBooking(String(booking._id), session);
+          throw new ApiError(410, "Seat hold expired. Please select seats again.");
+        }
+
+        await Payment.updateOne(
+          { _id: payment._id },
+          { status: "paid", providerPaymentId, providerSignature, paidAt: new Date() },
+          { session }
+        );
+        await Booking.updateOne(
+          { _id: booking._id },
+          { status: "confirmed", confirmedAt: new Date(), payment: payment._id },
+          { session }
+        );
+        await SeatReservation.updateMany(
+          { hold: hold._id, show: booking.show, seat: { $in: booking.seats } },
+          { status: "booked", booking: booking._id, $unset: { expiresAt: "" } },
+          { session }
+        );
+        await SeatHold.updateOne({ _id: hold._id }, { status: "booked" }, { session });
+
+        const user = await User.findById(userId).session(session);
+        if (user) {
+          await notificationService.send({
+            email: user.email,
+            mobile: user.mobile,
+            subject: "Booking confirmed",
+            message: `Your booking ${booking.bookingCode} is confirmed for seats ${booking.seats.join(", ")}.`
+          });
+        }
+
+        return Booking.findById(booking._id)
+          .populate("movie", "title language durationMinutes")
+          .populate("theater", "name city address")
+          .populate("show", "startsAt screenName")
+          .session(session);
+      });
+    } finally {
+      await session.endSession();
+    }
+  },
+
+  async failBooking(bookingId: string, session?: mongoose.ClientSession) {
+    const booking = await Booking.findById(bookingId).session(session ?? null);
+    if (!booking) return;
+    await Booking.updateOne({ _id: booking._id }, { status: "failed" }, { session });
+    await SeatHold.updateOne({ booking: booking._id, status: "held" }, { status: "released" }, { session });
+    await SeatReservation.deleteMany({ booking: booking._id, status: "held" }).session(session ?? null);
+  },
+
+  async cancelBooking(userId: string, bookingId: string, isAdmin = false) {
+    const booking = await Booking.findById(bookingId);
+    if (!booking) throw new ApiError(404, "Booking not found");
+    if (!isAdmin && String(booking.user) !== userId) throw new ApiError(403, "Booking does not belong to this user");
+    if (booking.status !== "confirmed") throw new ApiError(400, "Only confirmed bookings can be cancelled");
+
+    booking.status = "cancelled";
+    booking.cancelledAt = new Date();
+    await booking.save();
+    await SeatReservation.deleteMany({ booking: booking._id, status: "booked" });
+    if (booking.payment) {
+      await Payment.updateOne({ _id: booking.payment }, { status: "refunded" });
+    }
+    return booking;
+  },
+
+  toObjectId(id: string) {
+    if (!Types.ObjectId.isValid(id)) throw new ApiError(400, "Invalid id");
+    return new Types.ObjectId(id);
+  }
+};
