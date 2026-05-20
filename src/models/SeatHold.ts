@@ -15,7 +15,7 @@ const seatHoldSchema = new Schema<ISeatHold>(
     show: { type: Schema.Types.ObjectId, ref: "Show", required: true, index: true },
     seats: [{ type: String, required: true, trim: true, uppercase: true }],
     status: { type: String, enum: ["held", "booked", "expired", "released"], default: "held", index: true },
-    expiresAt: { type: Date, required: true, index: true },
+    expiresAt: { type: Date, required: true },
     booking: { type: Schema.Types.ObjectId, ref: "Booking" }
   },
   { timestamps: true }

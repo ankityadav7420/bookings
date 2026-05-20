@@ -15,8 +15,14 @@ const movieBody = z.object({
   certificate: z.string().min(1),
   releaseDate: z.coerce.date(),
   posterUrl: z.string().url().optional(),
+  bannerUrl: z.string().url().optional(),
   trailerUrl: z.string().url().optional(),
   cast: z.array(z.string()).default([]),
+  crew: z.array(z.object({ name: z.string().min(1), role: z.string().min(1) })).default([]),
+  ratingAverage: z.number().min(0).max(10).default(0),
+  ratingCount: z.number().int().min(0).default(0),
+  isTrending: z.boolean().default(false),
+  isRecommended: z.boolean().default(false),
   status: z.enum(["upcoming", "running", "ended"]).default("upcoming")
 });
 

@@ -1,43 +1,35 @@
-import { User } from "../models/User";
+import { authService } from "../services/auth.service";
 import { ApiError } from "../utils/ApiError";
 import { asyncHandler } from "../utils/asyncHandler";
-import { signToken } from "../utils/jwt";
-
-const toAuthResponse = (user: any) => ({
-  token: signToken({ id: String(user._id), role: user.role }),
-  user: {
-    id: user._id,
-    name: user.name,
-    email: user.email,
-    mobile: user.mobile,
-    role: user.role
-  }
-});
+import { sendCreated, sendSuccess } from "../utils/response";
 
 export const register = asyncHandler(async (req, res) => {
-  const { name, email, mobile, password } = req.body;
-  const existing = await User.findOne({ $or: [{ email }, { mobile }] });
-  if (existing) throw new ApiError(409, "Email or mobile already exists");
-
-  const user = await User.create({ name, email, mobile, password, role: "user" });
-  res.status(201).json({ success: true, data: toAuthResponse(user) });
+  const data = await authService.register(req.body);
+  sendCreated(res, data, "User registered successfully");
 });
 
 export const login = asyncHandler(async (req, res) => {
-  const { emailOrMobile, password } = req.body;
-  const user = await User.findOne({
-    $or: [{ email: emailOrMobile.toLowerCase() }, { mobile: emailOrMobile }]
-  }).select("+password");
-
-  if (!user || !(await (user as any).comparePassword(password))) {
-    throw new ApiError(401, "Invalid credentials");
-  }
-  if (!user.isActive) throw new ApiError(403, "User account is inactive");
-
-  res.json({ success: true, data: toAuthResponse(user) });
+  const data = await authService.login(req.body);
+  sendSuccess(res, data, "Logged in successfully");
 });
 
 export const me = asyncHandler(async (req, res) => {
-  const user = await User.findById(req.user?.id).select("-password");
-  res.json({ success: true, data: user });
+  const user = await authService.getProfile(req.user!.id);
+  sendSuccess(res, user);
+});
+
+export const logout = asyncHandler(async (req, res) => {
+  if (!req.authToken) throw new ApiError(401, "Authentication token is required");
+  await authService.logout(req.authToken);
+  sendSuccess(res, null, "Logged out successfully");
+});
+
+export const forgotPassword = asyncHandler(async (req, res) => {
+  await authService.forgotPassword(req.body.email);
+  sendSuccess(res, null, "If that email exists, a reset token has been sent");
+});
+
+export const resetPassword = asyncHandler(async (req, res) => {
+  await authService.resetPassword(req.body);
+  sendSuccess(res, null, "Password reset successfully");
 });

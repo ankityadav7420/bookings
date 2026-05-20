@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
+import { SEAT_CATEGORIES } from "../constants/enums";
 import { cancelShow, createShow, getShow, getShowSeats, listShows, updateShow } from "../controllers/show.controller";
 import { authenticate, authorize } from "../middlewares/auth.middleware";
 import { validate } from "../middlewares/validate.middleware";
@@ -14,7 +15,7 @@ const showBody = z.object({
   endsAt: z.coerce.date(),
   prices: z.array(
     z.object({
-      seatType: z.enum(["regular", "premium", "recliner"]),
+      seatType: z.enum(SEAT_CATEGORIES),
       price: z.number().min(0)
     })
   ),

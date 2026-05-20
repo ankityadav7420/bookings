@@ -10,6 +10,8 @@ export interface IUser {
   password: string;
   role: UserRole;
   isActive: boolean;
+  passwordResetTokenHash?: string;
+  passwordResetExpiresAt?: Date;
 }
 
 export type UserDocument = HydratedDocument<IUser> & {
@@ -23,7 +25,9 @@ const userSchema = new Schema<IUser>(
     mobile: { type: String, required: true, unique: true, trim: true },
     password: { type: String, required: true, minlength: 6, select: false },
     role: { type: String, enum: ["user", "admin"], default: "user" },
-    isActive: { type: Boolean, default: true }
+    isActive: { type: Boolean, default: true },
+    passwordResetTokenHash: { type: String, select: false },
+    passwordResetExpiresAt: { type: Date, select: false }
   },
   { timestamps: true }
 );

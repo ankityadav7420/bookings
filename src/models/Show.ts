@@ -1,7 +1,8 @@
 import { Schema, model, Types } from "mongoose";
+import { SEAT_CATEGORIES, SeatCategory } from "../constants/enums";
 
 export interface IPriceTier {
-  seatType: "regular" | "premium" | "recliner";
+  seatType: SeatCategory;
   price: number;
 }
 
@@ -18,7 +19,7 @@ export interface IShow {
 
 const priceTierSchema = new Schema<IPriceTier>(
   {
-    seatType: { type: String, enum: ["regular", "premium", "recliner"], required: true },
+    seatType: { type: String, enum: SEAT_CATEGORIES, required: true },
     price: { type: Number, required: true, min: 0 }
   },
   { _id: false }

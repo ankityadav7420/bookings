@@ -60,6 +60,7 @@ export const bookingService = {
         row: seat.row,
         number: seat.number,
         type: seat.type,
+        category: seat.type,
         isActive: seat.isActive,
         status: !seat.isActive ? "blocked" : reservedMap.get(seatNo) ?? "available"
       };
@@ -143,6 +144,28 @@ export const bookingService = {
     } finally {
       await session.endSession();
     }
+  },
+
+  async getUserBookings(userId: string) {
+    return Booking.find({ user: userId })
+      .populate("movie", "title posterUrl language")
+      .populate("theater", "name city")
+      .populate("show", "startsAt screenName")
+      .sort({ createdAt: -1 });
+  },
+
+  async getBookingForUser(userId: string, userRole: string, bookingId: string) {
+    const booking = await Booking.findOne({
+      _id: bookingId,
+      ...(userRole === "admin" ? {} : { user: userId })
+    })
+      .populate("movie", "title posterUrl language durationMinutes")
+      .populate("theater", "name city address")
+      .populate("show", "startsAt screenName")
+      .populate("payment");
+
+    if (!booking) throw new ApiError(404, "Booking not found");
+    return booking;
   },
 
   async confirmBooking(userId: string, providerOrderId: string, providerPaymentId: string, providerSignature: string) {

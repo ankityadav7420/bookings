@@ -18,7 +18,7 @@ const seatReservationSchema = new Schema<ISeatReservation>(
     hold: { type: Schema.Types.ObjectId, ref: "SeatHold" },
     booking: { type: Schema.Types.ObjectId, ref: "Booking" },
     status: { type: String, enum: ["held", "booked"], required: true, index: true },
-    expiresAt: { type: Date, index: true }
+    expiresAt: { type: Date }
   },
   { timestamps: true }
 );
