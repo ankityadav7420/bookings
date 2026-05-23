@@ -4,6 +4,7 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import morgan from "morgan";
 import { env } from "./config/env";
+import { isRedisHealthy } from "./config/redis";
 import { errorHandler, notFound } from "./middlewares/error.middleware";
 import { requestId } from "./middlewares/request-id.middleware";
 import adminRoutes from "./routes/admin.routes";
@@ -11,6 +12,7 @@ import authRoutes from "./routes/auth.routes";
 import bookingRoutes from "./routes/booking.routes";
 import homeRoutes from "./routes/home.routes";
 import movieRoutes from "./routes/movie.routes";
+import paymentWebhookRoutes from "./routes/payment-webhook.routes";
 import paymentRoutes from "./routes/payment.routes";
 import showRoutes from "./routes/show.routes";
 import theaterRoutes from "./routes/theater.routes";
@@ -23,6 +25,10 @@ app.set("trust proxy", 1);
 app.use(requestId);
 app.use(helmet());
 app.use(cors({ origin: env.clientUrl, credentials: true }));
+
+// Razorpay webhooks require the raw request body for signature verification.
+app.use("/api/payments/webhook", paymentWebhookRoutes);
+
 app.use(express.json({ limit: "1mb" }));
 app.use(morgan(env.nodeEnv === "production" ? "combined" : "dev"));
 app.use(
@@ -34,8 +40,13 @@ app.use(
   })
 );
 
-app.get("/health", (_req, res) => {
-  sendSuccess(res, { status: "ok", service: "movie-ticket-booking-backend" });
+app.get("/health", async (_req, res) => {
+  const redis = await isRedisHealthy();
+  sendSuccess(res, {
+    status: redis ? "ok" : "degraded",
+    service: "movie-ticket-booking-backend",
+    redis
+  });
 });
 
 app.use("/api/auth", authRoutes);

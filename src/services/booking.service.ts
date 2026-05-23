@@ -1,4 +1,5 @@
 import mongoose, { Types } from "mongoose";
+import { env } from "../config/env";
 import { Booking } from "../models/Booking";
 import { Payment } from "../models/Payment";
 import { SeatHold } from "../models/SeatHold";
@@ -9,8 +10,10 @@ import { User } from "../models/User";
 import { ApiError } from "../utils/ApiError";
 import { generateBookingCode } from "../utils/code";
 import { notificationService } from "./notification.service";
+import { seatLockService } from "./seat-lock.service";
 
-const HOLD_MINUTES = 8;
+const HOLD_MINUTES = env.holdMinutes;
+const HOLD_TTL_SECONDS = HOLD_MINUTES * 60;
 const CONVENIENCE_FEE_RATE = 0.05;
 
 const normalizeSeat = (seat: string): string => seat.trim().toUpperCase();
@@ -48,6 +51,12 @@ const calculateAmount = (selectedSeats: string[], screenSeats: Awaited<ReturnTyp
   return { amount, convenienceFee, totalAmount: amount + convenienceFee };
 };
 
+const releaseRedisForHold = async (showId: string, seats: string[], holdId: string): Promise<void> => {
+  await seatLockService.releaseForHold(showId, seats, holdId).catch((error) => {
+    console.error("[seat-lock] failed to release locks", { showId, holdId, error });
+  });
+};
+
 export const bookingService = {
   async getSeatMap(showId: string) {
     const { seats } = await getScreenSeats(showId);
@@ -76,18 +85,25 @@ export const bookingService = {
     const selectedSeats = [...new Set(rawSeats.map(normalizeSeat))];
     if (selectedSeats.length === 0) throw new ApiError(400, "At least one seat is required");
 
+    const holdId = new Types.ObjectId().toString();
+    const acquired = await seatLockService.acquire(showId, selectedSeats, holdId, userId, HOLD_TTL_SECONDS);
+    if (!acquired) {
+      throw new ApiError(409, "One or more selected seats are currently locked. Try again shortly.");
+    }
+
     const session = await mongoose.startSession();
     try {
       return await session.withTransaction(async () => {
         const { show, theater, seats } = await getScreenSeats(showId);
         const totals = calculateAmount(selectedSeats, seats, show);
-        const expiresAt = new Date(Date.now() + HOLD_MINUTES * 60 * 1000);
+        const expiresAt = new Date(Date.now() + HOLD_TTL_SECONDS * 1000);
 
         await this.releaseExpiredHolds(String(show._id), session);
 
         const hold = await SeatHold.create(
           [
             {
+              _id: holdId,
               user: userId,
               show: show._id,
               seats: selectedSeats,
@@ -143,6 +159,9 @@ export const bookingService = {
           message: "Seats held. Complete payment before hold expiry."
         };
       });
+    } catch (error) {
+      await releaseRedisForHold(showId, selectedSeats, holdId);
+      throw error;
     } finally {
       await session.endSession();
     }
@@ -173,6 +192,8 @@ export const bookingService = {
   async confirmBooking(userId: string, providerOrderId: string, providerPaymentId: string, providerSignature: string) {
     const session = await mongoose.startSession();
     let confirmedBookingId: Types.ObjectId | undefined;
+    let releaseContext: { showId: string; seats: string[]; holdId: string } | undefined;
+
     try {
       const confirmedBooking = await session.withTransaction(async () => {
         const payment = await Payment.findOne({ providerOrderId }).session(session);
@@ -228,6 +249,11 @@ export const bookingService = {
         }
         await SeatHold.updateOne({ _id: hold._id }, { status: "booked" }, { session });
 
+        releaseContext = {
+          showId: String(booking.show),
+          seats: booking.seats,
+          holdId: String(hold._id)
+        };
         confirmedBookingId = booking._id;
         return Booking.findById(booking._id)
           .populate("movie", "title language durationMinutes")
@@ -235,6 +261,11 @@ export const bookingService = {
           .populate("show", "startsAt screenName")
           .session(session);
       });
+
+      if (releaseContext) {
+        await releaseRedisForHold(releaseContext.showId, releaseContext.seats, releaseContext.holdId);
+      }
+
       if (confirmedBookingId) {
         const [booking, user] = await Promise.all([Booking.findById(confirmedBookingId), User.findById(userId)]);
         if (booking && user) {
@@ -257,12 +288,21 @@ export const bookingService = {
   async failBooking(bookingId: string, session?: mongoose.ClientSession) {
     const booking = await Booking.findById(bookingId).session(session ?? null);
     if (!booking) return;
+
+    const hold = await SeatHold.findOne({ booking: booking._id, status: "held" }).session(session ?? null);
+
     await Booking.updateOne({ _id: booking._id }, { status: "failed" }, { session });
-    const hold = await SeatHold.findOneAndUpdate({ booking: booking._id, status: "held" }, { status: "released" }, { session, new: true });
-    await SeatReservation.deleteMany({
-      status: "held",
-      $or: [{ booking: booking._id }, ...(hold ? [{ hold: hold._id }] : [])]
-    }).session(session ?? null);
+    if (hold) {
+      await SeatHold.updateOne({ _id: hold._id }, { status: "released" }, { session });
+      await SeatReservation.deleteMany({
+        status: "held",
+        $or: [{ booking: booking._id }, { hold: hold._id }]
+      }).session(session ?? null);
+
+      await releaseRedisForHold(String(booking.show), hold.seats, String(hold._id));
+    } else {
+      await SeatReservation.deleteMany({ booking: booking._id, status: "held" }).session(session ?? null);
+    }
   },
 
   async releaseExpiredHolds(showId?: string, session?: mongoose.ClientSession) {
@@ -271,18 +311,25 @@ export const bookingService = {
       status: "held",
       expiresAt: { $lte: now() }
     })
-      .select("_id booking")
+      .select("_id booking show seats")
       .session(session ?? null);
+
     if (expiredHolds.length === 0) return;
 
     const holdIds = expiredHolds.map((hold) => hold._id);
     const bookingIds = expiredHolds.flatMap((hold) => (hold.booking ? [hold.booking] : []));
+
     await SeatHold.updateMany({ _id: { $in: holdIds }, status: "held" }, { status: "expired" }, { session });
     await SeatReservation.deleteMany({ hold: { $in: holdIds }, status: "held" }).session(session ?? null);
+
     if (bookingIds.length > 0) {
       await Booking.updateMany({ _id: { $in: bookingIds }, status: "pending_payment" }, { status: "failed" }, { session });
       await Payment.updateMany({ booking: { $in: bookingIds }, status: "created" }, { status: "failed" }, { session });
     }
+
+    await Promise.all(
+      expiredHolds.map((hold) => releaseRedisForHold(String(hold.show), hold.seats, String(hold._id)))
+    );
   },
 
   async cancelBooking(userId: string, bookingId: string, isAdmin = false) {

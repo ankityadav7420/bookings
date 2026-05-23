@@ -4,7 +4,8 @@ export interface IPayment {
   booking: Types.ObjectId;
   user: Types.ObjectId;
   amount: number;
-  provider: "dummy_razorpay";
+  amountPaise: number;
+  provider: "razorpay";
   providerOrderId: string;
   providerPaymentId?: string;
   providerSignature?: string;
@@ -18,7 +19,8 @@ const paymentSchema = new Schema<IPayment>(
     booking: { type: Schema.Types.ObjectId, ref: "Booking", required: true },
     user: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
     amount: { type: Number, required: true, min: 0 },
-    provider: { type: String, enum: ["dummy_razorpay"], default: "dummy_razorpay" },
+    amountPaise: { type: Number, required: true, min: 1 },
+    provider: { type: String, enum: ["razorpay"], default: "razorpay" },
     providerOrderId: { type: String, required: true, unique: true, index: true },
     providerPaymentId: String,
     providerSignature: String,
