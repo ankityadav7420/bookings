@@ -14,6 +14,7 @@ const HOLD_MINUTES = 8;
 const CONVENIENCE_FEE_RATE = 0.05;
 
 const normalizeSeat = (seat: string): string => seat.trim().toUpperCase();
+const now = (): Date => new Date();
 
 const getScreenSeats = async (showId: string) => {
   const show = await Show.findById(showId).populate("theater");
@@ -50,7 +51,11 @@ const calculateAmount = (selectedSeats: string[], screenSeats: Awaited<ReturnTyp
 export const bookingService = {
   async getSeatMap(showId: string) {
     const { seats } = await getScreenSeats(showId);
-    const reservations = await SeatReservation.find({ show: showId });
+    await this.releaseExpiredHolds(showId);
+    const reservations = await SeatReservation.find({
+      show: showId,
+      $or: [{ status: "booked" }, { status: "held", expiresAt: { $gt: now() } }]
+    });
     const reservedMap = new Map(reservations.map((reservation) => [reservation.seat, reservation.status]));
 
     return seats.map((seat) => {
@@ -78,11 +83,7 @@ export const bookingService = {
         const totals = calculateAmount(selectedSeats, seats, show);
         const expiresAt = new Date(Date.now() + HOLD_MINUTES * 60 * 1000);
 
-        await SeatReservation.deleteMany({
-          show: show._id,
-          status: "held",
-          expiresAt: { $lte: new Date() }
-        }).session(session);
+        await this.releaseExpiredHolds(String(show._id), session);
 
         const hold = await SeatHold.create(
           [
@@ -133,6 +134,7 @@ export const bookingService = {
         );
 
         await SeatHold.updateOne({ _id: hold[0]._id }, { booking: booking[0]._id }, { session });
+        await SeatReservation.updateMany({ hold: hold[0]._id }, { booking: booking[0]._id }, { session });
 
         return {
           hold: hold[0],
@@ -170,56 +172,83 @@ export const bookingService = {
 
   async confirmBooking(userId: string, providerOrderId: string, providerPaymentId: string, providerSignature: string) {
     const session = await mongoose.startSession();
+    let confirmedBookingId: Types.ObjectId | undefined;
     try {
-      return await session.withTransaction(async () => {
+      const confirmedBooking = await session.withTransaction(async () => {
         const payment = await Payment.findOne({ providerOrderId }).session(session);
         if (!payment) throw new ApiError(404, "Payment order not found");
         if (String(payment.user) !== userId) throw new ApiError(403, "Payment does not belong to this user");
-        if (payment.status === "paid") throw new ApiError(400, "Payment is already verified");
 
         const booking = await Booking.findById(payment.booking).session(session);
         if (!booking) throw new ApiError(404, "Booking not found");
+        if (payment.status === "paid") {
+          if (payment.providerPaymentId !== providerPaymentId || payment.providerSignature !== providerSignature) {
+            throw new ApiError(409, "Payment order is already paid");
+          }
+          return Booking.findById(booking._id)
+            .populate("movie", "title language durationMinutes")
+            .populate("theater", "name city address")
+            .populate("show", "startsAt screenName")
+            .session(session);
+        }
+        if (payment.status !== "created") throw new ApiError(400, "Payment order cannot be verified");
         if (booking.status !== "pending_payment") throw new ApiError(400, "Booking is not pending payment");
 
-        const hold = await SeatHold.findOne({ booking: booking._id, status: "held" }).session(session);
-        if (!hold || hold.expiresAt <= new Date()) {
+        const hold = await SeatHold.findOne({ booking: booking._id, status: "held", expiresAt: { $gt: now() } }).session(session);
+        if (!hold) {
           await this.failBooking(String(booking._id), session);
           throw new ApiError(410, "Seat hold expired. Please select seats again.");
         }
 
-        await Payment.updateOne(
-          { _id: payment._id },
+        const paymentUpdate = await Payment.updateOne(
+          { _id: payment._id, status: "created" },
           { status: "paid", providerPaymentId, providerSignature, paidAt: new Date() },
           { session }
         );
-        await Booking.updateOne(
-          { _id: booking._id },
+        if (paymentUpdate.modifiedCount !== 1) {
+          throw new ApiError(409, "Payment is already being processed");
+        }
+
+        const bookingUpdate = await Booking.updateOne(
+          { _id: booking._id, status: "pending_payment" },
           { status: "confirmed", confirmedAt: new Date(), payment: payment._id },
           { session }
         );
-        await SeatReservation.updateMany(
-          { hold: hold._id, show: booking.show, seat: { $in: booking.seats } },
+        if (bookingUpdate.modifiedCount !== 1) {
+          throw new ApiError(409, "Booking is already being processed");
+        }
+
+        const reservationUpdate = await SeatReservation.updateMany(
+          { hold: hold._id, show: booking.show, seat: { $in: booking.seats }, status: "held" },
           { status: "booked", booking: booking._id, $unset: { expiresAt: "" } },
           { session }
         );
+        if (reservationUpdate.modifiedCount !== booking.seats.length) {
+          throw new ApiError(409, "Could not confirm all selected seats");
+        }
         await SeatHold.updateOne({ _id: hold._id }, { status: "booked" }, { session });
 
-        const user = await User.findById(userId).session(session);
-        if (user) {
-          await notificationService.send({
-            email: user.email,
-            mobile: user.mobile,
-            subject: "Booking confirmed",
-            message: `Your booking ${booking.bookingCode} is confirmed for seats ${booking.seats.join(", ")}.`
-          });
-        }
-
+        confirmedBookingId = booking._id;
         return Booking.findById(booking._id)
           .populate("movie", "title language durationMinutes")
           .populate("theater", "name city address")
           .populate("show", "startsAt screenName")
           .session(session);
       });
+      if (confirmedBookingId) {
+        const [booking, user] = await Promise.all([Booking.findById(confirmedBookingId), User.findById(userId)]);
+        if (booking && user) {
+          notificationService
+            .send({
+              email: user.email,
+              mobile: user.mobile,
+              subject: "Booking confirmed",
+              message: `Your booking ${booking.bookingCode} is confirmed for seats ${booking.seats.join(", ")}.`
+            })
+            .catch((error) => console.error("Failed to send booking notification", error));
+        }
+      }
+      return confirmedBooking;
     } finally {
       await session.endSession();
     }
@@ -229,8 +258,31 @@ export const bookingService = {
     const booking = await Booking.findById(bookingId).session(session ?? null);
     if (!booking) return;
     await Booking.updateOne({ _id: booking._id }, { status: "failed" }, { session });
-    await SeatHold.updateOne({ booking: booking._id, status: "held" }, { status: "released" }, { session });
-    await SeatReservation.deleteMany({ booking: booking._id, status: "held" }).session(session ?? null);
+    const hold = await SeatHold.findOneAndUpdate({ booking: booking._id, status: "held" }, { status: "released" }, { session, new: true });
+    await SeatReservation.deleteMany({
+      status: "held",
+      $or: [{ booking: booking._id }, ...(hold ? [{ hold: hold._id }] : [])]
+    }).session(session ?? null);
+  },
+
+  async releaseExpiredHolds(showId?: string, session?: mongoose.ClientSession) {
+    const expiredHolds = await SeatHold.find({
+      ...(showId ? { show: showId } : {}),
+      status: "held",
+      expiresAt: { $lte: now() }
+    })
+      .select("_id booking")
+      .session(session ?? null);
+    if (expiredHolds.length === 0) return;
+
+    const holdIds = expiredHolds.map((hold) => hold._id);
+    const bookingIds = expiredHolds.flatMap((hold) => (hold.booking ? [hold.booking] : []));
+    await SeatHold.updateMany({ _id: { $in: holdIds }, status: "held" }, { status: "expired" }, { session });
+    await SeatReservation.deleteMany({ hold: { $in: holdIds }, status: "held" }).session(session ?? null);
+    if (bookingIds.length > 0) {
+      await Booking.updateMany({ _id: { $in: bookingIds }, status: "pending_payment" }, { status: "failed" }, { session });
+      await Payment.updateMany({ booking: { $in: bookingIds }, status: "created" }, { status: "failed" }, { session });
+    }
   },
 
   async cancelBooking(userId: string, bookingId: string, isAdmin = false) {

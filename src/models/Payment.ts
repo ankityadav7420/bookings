@@ -15,7 +15,7 @@ export interface IPayment {
 
 const paymentSchema = new Schema<IPayment>(
   {
-    booking: { type: Schema.Types.ObjectId, ref: "Booking", required: true, index: true },
+    booking: { type: Schema.Types.ObjectId, ref: "Booking", required: true },
     user: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
     amount: { type: Number, required: true, min: 0 },
     provider: { type: String, enum: ["dummy_razorpay"], default: "dummy_razorpay" },
@@ -28,5 +28,8 @@ const paymentSchema = new Schema<IPayment>(
   },
   { timestamps: true }
 );
+
+paymentSchema.index({ booking: 1 }, { unique: true });
+paymentSchema.index({ providerPaymentId: 1 }, { unique: true, sparse: true });
 
 export const Payment = model<IPayment>("Payment", paymentSchema);

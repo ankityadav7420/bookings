@@ -11,8 +11,8 @@ export const paymentService = {
     if (!booking) throw new ApiError(404, "Booking not found");
     if (booking.status !== "pending_payment") throw new ApiError(400, "Booking is not pending payment");
 
-    const existing = await Payment.findOne({ booking: booking._id, status: "created" });
-    if (existing) {
+    const existing = await Payment.findOne({ booking: booking._id });
+    if (existing?.status === "created") {
       return {
         payment: existing,
         checkout: {
@@ -25,6 +25,8 @@ export const paymentService = {
         dummySuccessPayload: this.generateSuccessPayload(existing.providerOrderId)
       };
     }
+    if (existing?.status === "paid") throw new ApiError(409, "Booking is already paid");
+    if (existing) throw new ApiError(400, "Payment can no longer be created for this booking");
 
     const result = await this.createDummyRazorpayOrder(String(booking._id), userId, booking.totalAmount);
     return {
@@ -35,29 +37,46 @@ export const paymentService = {
 
   async createDummyRazorpayOrder(bookingId: string, userId: string, amount: number) {
     const providerOrderId = generateProviderOrderId();
-    const payment = await Payment.create({
-      booking: bookingId,
-      user: userId,
-      amount,
-      provider: "dummy_razorpay",
-      providerOrderId,
-      status: "created",
-      notes: {
-        checkout: "Use /api/payments/verify with success=true to simulate successful Razorpay payment."
-      }
-    });
-
-    return {
-      payment,
-      checkout: {
-        key: env.razorpayKeyId,
+    try {
+      const payment = await Payment.create({
+        booking: bookingId,
+        user: userId,
         amount,
-        currency: "INR",
-        orderId: providerOrderId,
-        name: "Movie Ticket Booking",
-        description: "Dummy Razorpay order"
-      }
-    };
+        provider: "dummy_razorpay",
+        providerOrderId,
+        status: "created",
+        notes: {
+          checkout: "Use /api/payments/verify with success=true to simulate successful Razorpay payment."
+        }
+      });
+
+      return {
+        payment,
+        checkout: {
+          key: env.razorpayKeyId,
+          amount,
+          currency: "INR",
+          orderId: providerOrderId,
+          name: "Movie Ticket Booking",
+          description: "Dummy Razorpay order"
+        }
+      };
+    } catch (error: any) {
+      if (error?.code !== 11000) throw error;
+      const payment = await Payment.findOne({ booking: bookingId, status: "created" });
+      if (!payment) throw new ApiError(409, "Payment order already exists");
+      return {
+        payment,
+        checkout: {
+          key: env.razorpayKeyId,
+          amount: payment.amount,
+          currency: "INR",
+          orderId: payment.providerOrderId,
+          name: "Movie Ticket Booking",
+          description: "Dummy Razorpay order"
+        }
+      };
+    }
   },
 
   generateSuccessPayload(providerOrderId: string) {
@@ -74,10 +93,10 @@ export const paymentService = {
   async verify(userId: string, input: { providerOrderId: string; providerPaymentId: string; providerSignature: string; success?: boolean }) {
     const payment = await Payment.findOne({ providerOrderId: input.providerOrderId });
     if (!payment) throw new ApiError(404, "Payment order not found");
+    if (String(payment.user) !== userId) throw new ApiError(403, "Payment does not belong to this user");
 
     if (input.success === false) {
-      payment.status = "failed";
-      await payment.save();
+      await Payment.updateOne({ _id: payment._id, status: "created" }, { status: "failed" });
       await bookingService.failBooking(String(payment.booking));
       throw new ApiError(402, "Dummy payment failed");
     }

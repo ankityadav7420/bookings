@@ -24,7 +24,7 @@ const numberEnv = (key: string, fallback: number): number => {
 
 export const env = {
   nodeEnv: optionalEnv("NODE_ENV", "development"),
-  port: numberEnv("PORT", 5000),
+  port: numberEnv("PORT", 5001),
   mongoUri: requireEnv("MONGO_URI"),
   jwtSecret: requireEnv("JWT_SECRET"),
   jwtExpiresIn: optionalEnv("JWT_EXPIRES_IN", "7d"),
